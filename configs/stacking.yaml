@@ -1,0 +1,69 @@
+# PyroSense Stacking Ensemble Configuration
+# ==========================================
+
+data:
+  # Mesogeos datacube for fire labels
+  mesogeos_path: "data/mesogeos/mesogeos.zarr"
+  region: "greece"  # greece, mediterranean
+
+  # Event sampling
+  n_samples: 200
+  start_year: 2015
+  end_year: 2021
+  negative_ratio: 1.0  # 1:1 fire to no-fire
+
+  # Train/test split
+  test_size: 0.2
+
+  # Caching
+  events_cache: "data/fire_events.csv"
+  feature_store: "data/features/"
+  hls_dir: "data/hls/"
+
+features:
+  prithvi:
+    enabled: true
+    model_name: "Prithvi-EO-2.0-300M"
+    days_before: 14  # Days before fire to search for imagery
+
+  weather:
+    enabled: true
+    days_before: 7  # Days of weather data to aggregate
+
+  alphaearth:
+    enabled: false  # Requires Earth Engine auth
+    cache_dir: "data/alphaearth/"
+
+model:
+  type: "stacking"
+  cv_folds: 5
+  use_probabilities: true
+  scale_features: true
+  random_state: 42
+
+  # Base models for each feature source
+  base_models:
+    prithvi:
+      type: "rf"
+      n_estimators: 100
+      max_depth: 15
+
+    weather:
+      type: "rf"
+      n_estimators: 50
+      max_depth: 10
+
+    alphaearth:
+      type: "rf"
+      n_estimators: 100
+      max_depth: 15
+
+  # Meta-learner
+  meta_model:
+    type: "lr"
+    max_iter: 1000
+
+output:
+  dir: "outputs/"
+  save_model: true
+  save_features: true
