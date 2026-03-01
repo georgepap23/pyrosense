@@ -133,12 +133,23 @@ def train(config: str, output: str, skip_download: bool, skip_extraction: bool):
     if not skip_extraction or not store.exists("prithvi"):
         # Extract Prithvi features
         if feature_cfg.get("prithvi", {}).get("enabled", True):
-            click.echo("Extracting Prithvi features...")
-            prithvi = PrithviExtractor(
-                hls_dir=data_cfg.get("hls_dir", "data/hls/"),
-            )
-            prithvi_df = prithvi.extract_batch(all_events)
-            store.save("prithvi", prithvi_df)
+            prithvi_cfg = feature_cfg.get("prithvi", {})
+            model_name = prithvi_cfg.get("model_name", "Prithvi-EO-2.0-300M")
+
+            # Check if cached features match the desired model
+            if store.check_model_match("prithvi", model_name):
+                click.echo(f"✓ Using cached Prithvi features ({model_name})")
+            else:
+                if store.exists("prithvi"):
+                    click.echo(f"⚠️ Cached features exist but were created with a different model")
+                click.echo(f"Extracting Prithvi features (model: {model_name})...")
+                prithvi = PrithviExtractor(
+                    model_name=model_name,
+                    hls_dir=data_cfg.get("hls_dir", "data/hls/"),
+                )
+                prithvi_df = prithvi.extract_batch(all_events)
+                store.save("prithvi", prithvi_df, metadata={"model_name": model_name})
+                click.echo(f"✓ Saved {len(prithvi_df)} events with model metadata")
 
         # Extract weather features
         if feature_cfg.get("weather", {}).get("enabled", True):
@@ -227,7 +238,13 @@ def train(config: str, output: str, skip_download: bool, skip_extraction: bool):
     required=True,
     help="Date (YYYY-MM-DD)",
 )
-def predict(model: str, lat: float, lon: float, date: str):
+@click.option(
+    "--prithvi-model",
+    type=str,
+    default="Prithvi-EO-2.0-300M",
+    help="Prithvi model to use (Prithvi-EO-2.0-300M or Prithvi-EO-2.0-300M-TL)",
+)
+def predict(model: str, lat: float, lon: float, date: str, prithvi_model: str):
     """Make a prediction for a single location."""
     from pyrosense.data import FireEvent, HLSDownloader
     from pyrosense.features import PrithviExtractor
@@ -262,6 +279,7 @@ def predict(model: str, lat: float, lon: float, date: str):
     features = {}
 
     # Step 1: Download HLS imagery if Prithvi features are needed
+    prithvi_success = False
     if "prithvi" in feature_sources:
         with tempfile.TemporaryDirectory() as temp_dir:
             click.echo("Step 1/3: Downloading HLS satellite imagery...")
@@ -280,21 +298,36 @@ def predict(model: str, lat: float, lon: float, date: str):
                         click.echo(f"  ✓ Downloaded HLS imagery: {image_path.name}")
 
                         # Extract Prithvi features
-                        click.echo("\nStep 2/3: Extracting Prithvi features (satellite imagery)...")
-                        prithvi = PrithviExtractor(device="auto")
+                        click.echo(f"\nStep 2/3: Extracting Prithvi features (model: {prithvi_model})...")
+                        prithvi = PrithviExtractor(model_name=prithvi_model, device="auto")
                         prithvi_result = prithvi.extract(event, image_path=image_path)
                         for name, val in zip(prithvi_result.feature_names, prithvi_result.features):
                             features[f"prithvi_{name}"] = val
                         click.echo(f"  ✓ Extracted {len(prithvi_result.features)} Prithvi features")
+                        prithvi_success = True
                     else:
                         click.echo("  ✗ No HLS imagery available for this location/date")
-                        click.echo("    Continuing with weather features only...")
                 else:
-                    click.echo("  ✗ HLS download failed")
-                    click.echo("    Continuing with weather features only...")
+                    click.echo("  ✗ No HLS imagery found after all retry attempts")
             except Exception as e:
                 click.echo(f"  ✗ Error downloading HLS imagery: {e}")
-                click.echo("    Continuing with weather features only...")
+
+        # If Prithvi is required but failed, exit with error
+        if not prithvi_success:
+            click.echo("\n" + "="*60)
+            click.echo("ERROR: Cannot make prediction without satellite imagery")
+            click.echo("="*60)
+            click.echo("\nNo cloud-free HLS imagery found for this location and date.")
+            click.echo("\nPossible reasons:")
+            click.echo("  • Heavy cloud cover during the search period (30 days before event)")
+            click.echo("  • Location is over ocean or outside HLS coverage area")
+            click.echo("  • Imagery not yet available for recent dates")
+            click.echo("\nSuggestions:")
+            click.echo("  • Try a different date (earlier or later)")
+            click.echo("  • Try a nearby location")
+            click.echo("  • Train a weather-only model if satellite data is often unavailable")
+            click.echo("="*60)
+            sys.exit(1)
     else:
         click.echo("Step 1/3: Skipping satellite imagery (not used by model)")
         click.echo("Step 2/3: Skipping Prithvi features (not used by model)")
@@ -439,7 +472,13 @@ def download(n_samples: int, output: str, mesogeos_path: str):
     default="all",
     help="Feature source to extract",
 )
-def features(events: str, output: str, source: str):
+@click.option(
+    "--prithvi-model",
+    type=str,
+    default="Prithvi-EO-2.0-300M",
+    help="Prithvi model to use (Prithvi-EO-2.0-300M or Prithvi-EO-2.0-300M-TL)",
+)
+def features(events: str, output: str, source: str, prithvi_model: str):
     """Extract features from events."""
     from pyrosense.data import load_events_csv
     from pyrosense.features import PrithviExtractor, WeatherExtractor, FeatureStore
@@ -455,13 +494,17 @@ def features(events: str, output: str, source: str):
         logger.info(f"Extracting {src} features")
 
         if src == "prithvi":
-            extractor = PrithviExtractor()
+            extractor = PrithviExtractor(model_name=prithvi_model)
+            logger.info(f"Using Prithvi model: {prithvi_model}")
+            metadata = {"model_name": prithvi_model}
         elif src == "weather":
             extractor = WeatherExtractor()
+            metadata = None
         elif src == "alphaearth":
             try:
                 from pyrosense.features import AlphaEarthExtractor
                 extractor = AlphaEarthExtractor()
+                metadata = None
             except ImportError:
                 logger.error("AlphaEarth requires earthengine-api. Install with: pip install earthengine-api")
                 continue
@@ -469,7 +512,7 @@ def features(events: str, output: str, source: str):
             continue
 
         df = extractor.extract_batch(all_events)
-        store.save(src, df)
+        store.save(src, df, metadata=metadata)
 
     click.echo(f"\nFeatures saved to {output}")
 

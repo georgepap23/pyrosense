@@ -23,7 +23,7 @@ data:
 features:
   prithvi:
     enabled: true
-    model_name: "Prithvi-EO-2.0-300M"
+    model_name: "Prithvi-EO-2.0-300M"  # TL model with temporal/location support
     days_before: 14  # Days before fire to search for imagery
 
   weather:

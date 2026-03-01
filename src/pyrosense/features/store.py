@@ -202,6 +202,30 @@ class FeatureStore:
         """Check if features exist in store."""
         return self._get_feature_path(source, version).exists()
 
+    def check_model_match(self, source: str, model_name: str, version: str = "v1") -> bool:
+        """
+        Check if cached features were created with the specified model.
+
+        Args:
+            source: Feature source name (e.g., "prithvi")
+            model_name: Model name to check (e.g., "Prithvi-EO-2.0-300M-TL")
+            version: Version to check
+
+        Returns:
+            True if features exist and match the model, False otherwise
+        """
+        if not self.exists(source, version):
+            return False
+
+        metadata = self.get_metadata(source)
+        if not metadata:
+            return False
+
+        version_meta = metadata.get("versions", {}).get(version, {})
+        cached_model = version_meta.get("model_name")
+
+        return cached_model == model_name
+
     def list_sources(self) -> list[str]:
         """List all available sources."""
         sources = []

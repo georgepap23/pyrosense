@@ -67,12 +67,186 @@ class PrithviFeatures:
 HLS_MEAN = [0.033, 0.033, 0.033, 0.033, 0.033, 0.033]
 HLS_STD = [1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
 
+
+# Sinusoidal position encoding (for TL models)
+def _get_1d_sincos_embed(embed_dim: int, pos: torch.Tensor) -> torch.Tensor:
+    """
+    Generate 1D sinusoidal position embeddings.
+
+    Args:
+        embed_dim: Embedding dimension (must be even)
+        pos: Positions to encode, shape (M,)
+
+    Returns:
+        Embeddings of shape (M, embed_dim)
+    """
+    omega = torch.arange(embed_dim // 2, dtype=pos.dtype, device=pos.device)
+    omega /= embed_dim / 2.0
+    omega = 1.0 / 10000 ** omega  # (D/2,)
+
+    out = torch.einsum("m,d->md", pos, omega)  # Outer product: (M, D/2)
+
+    emb_sin = torch.sin(out)
+    emb_cos = torch.cos(out)
+
+    emb = torch.cat([emb_sin, emb_cos], dim=1)  # (M, D)
+    return emb
+
+
+class TemporalEncoder(nn.Module):
+    """
+    Encodes temporal coordinates (year, julian_day) as sinusoidal embeddings.
+
+    Based on Prithvi-TL implementation from:
+    https://huggingface.co/ibm-nasa-geospatial/Prithvi-EO-2.0-300M-TL
+    """
+
+    def __init__(self, embed_dim: int = 1024, trainable_scale: bool = True):
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.year_embed_dim = embed_dim // 2
+        self.julian_day_embed_dim = embed_dim - self.year_embed_dim
+
+        if trainable_scale:
+            self.scale = nn.Parameter(torch.full((1,), 0.1))
+        else:
+            self.register_buffer('scale', torch.ones(1))
+
+    def forward(self, temporal_coords: torch.Tensor, tokens_per_frame: int = 196) -> torch.Tensor:
+        """
+        Args:
+            temporal_coords: (B, T, 2) where [:, :, 0] = year, [:, :, 1] = julian_day
+            tokens_per_frame: Number of patch tokens per frame (default 196 for 224x224 with 16x16 patches)
+
+        Returns:
+            Temporal embeddings of shape (B, T*tokens_per_frame, embed_dim)
+        """
+        shape = temporal_coords.shape[:2] + (-1,)  # (B, T, embed_dim)
+
+        # Encode year
+        year = _get_1d_sincos_embed(
+            self.year_embed_dim,
+            temporal_coords[:, :, 0].flatten()
+        ).reshape(shape)
+
+        # Encode julian day
+        julian_day = _get_1d_sincos_embed(
+            self.julian_day_embed_dim,
+            temporal_coords[:, :, 1].flatten()
+        ).reshape(shape)
+
+        # Combine and scale
+        embedding = self.scale * torch.cat([year, julian_day], dim=-1)
+
+        # Repeat for each patch token in the frame
+        if tokens_per_frame is not None:
+            embedding = torch.repeat_interleave(embedding, tokens_per_frame, dim=1)
+
+        return embedding  # (B, T*tokens_per_frame, embed_dim)
+
+
+class LocationEncoder(nn.Module):
+    """
+    Encodes location coordinates (lat, lon) as sinusoidal embeddings.
+
+    Based on Prithvi-TL implementation from:
+    https://huggingface.co/ibm-nasa-geospatial/Prithvi-EO-2.0-300M-TL
+    """
+
+    def __init__(self, embed_dim: int = 1024, trainable_scale: bool = True):
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.lat_embed_dim = embed_dim // 2
+        self.lon_embed_dim = embed_dim - self.lat_embed_dim
+
+        if trainable_scale:
+            self.scale = nn.Parameter(torch.full((1,), 0.1))
+        else:
+            self.register_buffer('scale', torch.ones(1))
+
+    def forward(self, location_coords: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            location_coords: (B, 2) where [:, 0] = latitude, [:, 1] = longitude
+
+        Returns:
+            Location embeddings of shape (B, 1, embed_dim)
+        """
+        shape = location_coords.shape[:1] + (1, -1)  # (B, 1, embed_dim)
+
+        # Encode latitude
+        lat = _get_1d_sincos_embed(
+            self.lat_embed_dim,
+            location_coords[:, 0].flatten()
+        ).reshape(shape)
+
+        # Encode longitude
+        lon = _get_1d_sincos_embed(
+            self.lon_embed_dim,
+            location_coords[:, 1].flatten()
+        ).reshape(shape)
+
+        # Combine and scale
+        embedding = self.scale * torch.cat([lat, lon], dim=-1)
+
+        return embedding  # (B, 1, embed_dim)
+
+
+def prepare_temporal_coords(date: pd.Timestamp, device: torch.device) -> torch.Tensor:
+    """
+    Prepare temporal coordinates for Prithvi-TL model.
+
+    Args:
+        date: Event date
+        device: Torch device
+
+    Returns:
+        Tensor of shape (1, 1, 2) with [year, julian_day]
+    """
+    year = float(date.year)
+    julian_day = float(date.dayofyear)
+
+    temporal_coords = torch.tensor(
+        [[[year, julian_day]]],
+        dtype=torch.float32,
+        device=device
+    )
+    return temporal_coords
+
+
+def prepare_location_coords(lat: float, lon: float, device: torch.device) -> torch.Tensor:
+    """
+    Prepare location coordinates for Prithvi-TL model.
+
+    Args:
+        lat: Latitude in degrees
+        lon: Longitude in degrees
+        device: Torch device
+
+    Returns:
+        Tensor of shape (1, 2) with [lat, lon]
+    """
+    location_coords = torch.tensor(
+        [[lat, lon]],
+        dtype=torch.float32,
+        device=device
+    )
+    return location_coords
+
+
 # HuggingFace repo for Prithvi weights
 PRITHVI_REPOS: dict[str, dict[str, str]] = {
     "Prithvi-EO-2.0-300M": {
         "repo_id": "ibm-nasa-geospatial/Prithvi-EO-2.0-300M",
         "filename": "Prithvi_EO_V2_300M.pt",
         "timm_model": "vit_large_patch16_224",  # ViT-Large: 24 blocks, 1024-dim
+        "has_tl": False,
+    },
+    "Prithvi-EO-2.0-300M-TL": {
+        "repo_id": "ibm-nasa-geospatial/Prithvi-EO-2.0-300M-TL",
+        "filename": "Prithvi_EO_V2_300M_TL.pt",
+        "timm_model": "vit_large_patch16_224",  # Same architecture
+        "has_tl": True,  # Supports temporal and location embeddings
     },
 }
 
@@ -135,6 +309,9 @@ class PrithviExtractor(BaseFeatureExtractor):
         Creates a ViT-Large via timm, then loads Prithvi's pre-trained
         encoder weights from HuggingFace Hub. Only the encoder is used
         (the MAE decoder is discarded).
+
+        For TL models, adds temporal and location encoders with learned scale
+        parameters loaded from the checkpoint.
         """
         if not TIMM_AVAILABLE:
             logger.warning("timm not available, using mock model")
@@ -146,6 +323,17 @@ class PrithviExtractor(BaseFeatureExtractor):
             return self._create_mock_model()
 
         logger.info(f"Loading Prithvi model: {self.model_name}")
+
+        return self._load_base_model(model_info)
+
+    def _load_base_model(self, model_info: dict) -> nn.Module:
+        """Load Prithvi model with optional TL support."""
+        is_tl = model_info.get("has_tl", False)
+
+        if is_tl:
+            logger.info("Loading TL model with temporal/location embedding support")
+        else:
+            logger.info("Loading base model")
 
         try:
             # Create ViT-Large architecture matching Prithvi's encoder
@@ -187,6 +375,74 @@ class PrithviExtractor(BaseFeatureExtractor):
                 f"missing: {len(result.missing_keys)}, "
                 f"unexpected: {len(result.unexpected_keys)})"
             )
+
+            # If TL model, add temporal and location encoders
+            if is_tl:
+                model.temporal_embed_enc = TemporalEncoder(embed_dim=1024, trainable_scale=True)
+                model.location_embed_enc = LocationEncoder(embed_dim=1024, trainable_scale=True)
+
+                # Load learned scale parameters from checkpoint
+                if "encoder.temporal_embed_enc.scale" in checkpoint:
+                    model.temporal_embed_enc.scale.data = checkpoint["encoder.temporal_embed_enc.scale"]
+                    logger.info("Loaded temporal embedding scale from checkpoint")
+
+                if "encoder.location_embed_enc.scale" in checkpoint:
+                    model.location_embed_enc.scale.data = checkpoint["encoder.location_embed_enc.scale"]
+                    logger.info("Loaded location embedding scale from checkpoint")
+
+                # Store original forward_features method
+                original_forward_features = model.forward_features
+
+                # Wrap forward to inject temporal and location embeddings
+                def forward_with_tl(x, temporal_coords=None, location_coords=None):
+                    # Get patch embeddings
+                    x = model.patch_embed(x)
+
+                    # Add CLS token
+                    cls_token = model.cls_token.expand(x.shape[0], -1, -1)
+                    x = torch.cat((cls_token, x), dim=1)
+
+                    # Add positional embeddings
+                    x = x + model.pos_embed
+
+                    # Add temporal embeddings if provided
+                    if temporal_coords is not None:
+                        temporal_emb = model.temporal_embed_enc(temporal_coords, tokens_per_frame=196)
+                        # temporal_emb is (B, 196, 1024), x is (B, 197, 1024) with CLS token
+                        # Add to patch tokens only (skip CLS token)
+                        x[:, 1:, :] = x[:, 1:, :] + temporal_emb
+
+                    # Add location embeddings if provided
+                    if location_coords is not None:
+                        location_emb = model.location_embed_enc(location_coords)
+                        # location_emb is (B, 1, 1024), broadcast to all tokens
+                        x = x + location_emb
+
+                    x = model.pos_drop(x)
+
+                    # Pass through transformer blocks
+                    x = model.blocks(x)
+                    x = model.norm(x)
+
+                    return x
+
+                # Replace forward_features with TL-enabled version
+                model.forward_features = forward_with_tl
+
+                # Also wrap main forward() to accept TL parameters
+                original_forward = model.forward
+
+                def forward_wrapper(x, temporal_coords=None, location_coords=None):
+                    # Call forward_features with TL params
+                    x = forward_with_tl(x, temporal_coords, location_coords)
+                    # Apply head/pooling
+                    x = model.forward_head(x)
+                    return x
+
+                model.forward = forward_wrapper
+                model.has_tl = True
+            else:
+                model.has_tl = False
 
             model = model.to(self.device)
             model.eval()
@@ -331,7 +587,26 @@ class PrithviExtractor(BaseFeatureExtractor):
 
         image_path = Path(image_path)
         tensor = self.preprocess_image(image_path, event.latitude, event.longitude)
-        features = self.model(tensor)
+
+        # Check if model has TL support
+        if hasattr(self.model, 'has_tl') and self.model.has_tl:
+            # Prepare temporal and location coordinates
+            temporal_coords = prepare_temporal_coords(event.date, self.device)
+            location_coords = prepare_location_coords(event.latitude, event.longitude, self.device)
+
+            # Forward pass with TL embeddings
+            features = self.model(
+                tensor,
+                temporal_coords=temporal_coords,
+                location_coords=location_coords,
+            )
+            logger.debug(
+                f"TL inference: date={event.date.date()}, "
+                f"lat={event.latitude:.4f}, lon={event.longitude:.4f}"
+            )
+        else:
+            # Standard forward pass
+            features = self.model(tensor)
 
         # Handle various output shapes
         if len(features.shape) > 2:
@@ -345,7 +620,11 @@ class PrithviExtractor(BaseFeatureExtractor):
             features=features_np,
             feature_names=self.feature_names,
             source=self.source_name,
-            metadata={"model_name": self.model_name, "image_path": str(image_path)},
+            metadata={
+                "model_name": self.model_name,
+                "image_path": str(image_path),
+                "has_tl": hasattr(self.model, 'has_tl') and self.model.has_tl,
+            },
         )
 
     def extract_batch(
