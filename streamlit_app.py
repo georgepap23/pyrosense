@@ -216,8 +216,18 @@ with tab2:
                         # Parse the structured report from CLI output
                         report_sections = {}
                         current_section = None
+                        fire_probability = None
 
                         for line in output.split('\n'):
+                            # Extract fire probability if present
+                            if 'Fire Probability:' in line:
+                                try:
+                                    fire_prob_str = line.split(':')[1].strip().rstrip('%')
+                                    fire_probability = float(fire_prob_str)
+                                except:
+                                    pass
+
+                            # Parse sections
                             if 'SUMMARY:' in line:
                                 current_section = 'summary'
                                 report_sections[current_section] = []
@@ -233,28 +243,38 @@ with tab2:
                             elif 'RISK ASSESSMENT:' in line:
                                 current_section = 'risk'
                                 report_sections[current_section] = []
-                            elif current_section and line.strip() and not line.startswith('='):
+                            elif current_section and line.strip() and not line.startswith('=') and 'Fire Probability' not in line and 'Location:' not in line:
                                 report_sections[current_section].append(line.strip())
 
                         # Display the report
-                        st.markdown(f"""
-                        **🔍 EARTHDIAL INTELLIGENCE REPORT**
+                        if report_sections:
+                            st.markdown("### 🔍 EARTHDIAL INTELLIGENCE REPORT")
 
-                        **📊 Summary:**
-                        {chr(10).join(report_sections.get('summary', ['No summary available']))}
+                            if fire_probability is not None:
+                                st.metric("🔥 Fire Probability", f"{fire_probability:.1f}%")
 
-                        **🌿 Vegetation Analysis:**
-                        {chr(10).join(report_sections.get('vegetation', ['No data']))}
+                            if report_sections.get('summary'):
+                                st.markdown("**📊 Summary:**")
+                                st.write('\n'.join(report_sections['summary']))
 
-                        **⛰️ Terrain Factors:**
-                        {chr(10).join(report_sections.get('terrain', ['No data']))}
+                            if report_sections.get('vegetation'):
+                                st.markdown("**🌿 Vegetation Analysis:**")
+                                st.write('\n'.join(report_sections['vegetation']))
 
-                        **🚒 Recommended Strategies:**
-                        {chr(10).join(report_sections.get('strategies', ['No data']))}
+                            if report_sections.get('terrain'):
+                                st.markdown("**⛰️ Terrain Factors:**")
+                                st.write('\n'.join(report_sections['terrain']))
 
-                        **⚠️ Risk Assessment:**
-                        {chr(10).join(report_sections.get('risk', ['No data']))}
-                        """)
+                            if report_sections.get('strategies'):
+                                st.markdown("**🚒 Recommended Strategies:**")
+                                st.write('\n'.join(report_sections['strategies']))
+
+                            if report_sections.get('risk'):
+                                st.markdown("**⚠️ Risk Assessment:**")
+                                st.write('\n'.join(report_sections['risk']))
+                        else:
+                            st.warning("Report generated but couldn't parse sections. Raw output:")
+                            st.code(output)
                     else:
                         st.error(f"Analysis failed: {result.stderr}")
                         status.update(label="Analysis Failed", state="error")
@@ -303,15 +323,22 @@ with tab2:
                             if result.returncode == 0:
                                 # Extract the response from CLI output
                                 output = result.stdout
-                                # The response is between the last set of "===" markers
+                                # The response is between "EarthDial Analysis:" and the final "==="
                                 lines = output.split('\n')
                                 response_lines = []
                                 capture = False
+                                found_header = False
+
                                 for line in lines:
                                     if 'EarthDial Analysis:' in line:
+                                        found_header = True
+                                        continue
+                                    if found_header and line.startswith('==='):
+                                        # Skip the separator right after the header
                                         capture = True
                                         continue
                                     if capture and line.startswith('==='):
+                                        # End of response
                                         break
                                     if capture and line.strip():
                                         response_lines.append(line.strip())

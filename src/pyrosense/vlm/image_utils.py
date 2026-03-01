@@ -84,10 +84,32 @@ def hls_to_rgb(
         green = src.read(2, window=window).astype(np.float32)
         blue = src.read(1, window=window).astype(np.float32)
 
+        # Check if crop has valid data
+        valid_pixels = np.count_nonzero(~np.isnan(red))
+        if valid_pixels < crop_size * crop_size * 0.1:  # Less than 10% valid
+            logger.warning(
+                f"Target location ({center_lat}, {center_lon}) is in a clouded/masked area "
+                f"({valid_pixels}/{crop_size**2} valid pixels). Using image center instead."
+            )
+            # Fallback to center of image
+            center_row, center_col = src.height // 2, src.width // 2
+            row_start = max(0, center_row - half_size)
+            col_start = max(0, center_col - half_size)
+            row_start = min(row_start, src.height - crop_size)
+            col_start = min(col_start, src.width - crop_size)
+            window = Window(col_start, row_start, crop_size, crop_size)
+
+            # Re-read with new window
+            red = src.read(3, window=window).astype(np.float32)
+            green = src.read(2, window=window).astype(np.float32)
+            blue = src.read(1, window=window).astype(np.float32)
+            valid_pixels = np.count_nonzero(~np.isnan(red))
+
         logger.debug(
             f"Cropped {crop_size}x{crop_size} pixels "
             f"({crop_size * 30 / 1000:.1f} km × {crop_size * 30 / 1000:.1f} km) "
-            f"from {src.width}x{src.height} image"
+            f"from {src.width}x{src.height} image "
+            f"({valid_pixels}/{crop_size**2} valid pixels)"
         )
 
     # Stack RGB
