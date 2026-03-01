@@ -478,11 +478,17 @@ def features(events: str, output: str, source: str):
 @click.option(
     "--image", "-i",
     type=click.Path(exists=True),
-    required=True,
-    help="Path to HLS composite or RGB image",
+    default=None,
+    help="Path to HLS composite or RGB image (optional if --lat/--lon/--date provided)",
 )
-@click.option("--lat", type=float, default=None, help="Latitude (optional)")
-@click.option("--lon", type=float, default=None, help="Longitude (optional)")
+@click.option("--lat", type=float, default=None, help="Latitude (required if no --image)")
+@click.option("--lon", type=float, default=None, help="Longitude (required if no --image)")
+@click.option(
+    "--date", "-d",
+    type=str,
+    default=None,
+    help="Date (YYYY-MM-DD) for downloading imagery (required if no --image)",
+)
 @click.option(
     "--model-path", "-m",
     type=click.Path(exists=True),
@@ -506,7 +512,7 @@ def features(events: str, output: str, source: str):
     is_flag=True,
     help="Use 8-bit quantization (lower memory)",
 )
-def analyze(image: str, lat: float, lon: float, model_path: str, question: str, device: str, load_8bit: bool):
+def analyze(image: str, lat: float, lon: float, date: str, model_path: str, question: str, device: str, load_8bit: bool):
     """Analyze a satellite image with EarthDial VLM."""
     # Suppress verbose warnings for cleaner output
     import warnings
@@ -540,6 +546,56 @@ def analyze(image: str, lat: float, lon: float, model_path: str, question: str, 
             sys.stdout = old_stdout
             sys.stderr = old_stderr
 
+    # Validate inputs: must provide either --image OR --lat/--lon/--date
+    if image is None:
+        if lat is None or lon is None or date is None:
+            click.echo("Error: Must provide either --image OR all of --lat, --lon, --date")
+            return
+
+        # Download HLS imagery on-demand
+        from pyrosense.data import FireEvent, HLSDownloader
+        import tempfile
+
+        click.echo(f"Downloading HLS imagery for ({lat}, {lon}) on {date}...")
+
+        # Create event
+        event = FireEvent(
+            event_id="query",
+            latitude=lat,
+            longitude=lon,
+            date=pd.Timestamp(date),
+            burned_area=0.0,
+        )
+
+        # Use cache directory for downloaded images
+        cache_dir = Path.home() / ".pyrosense" / "cache" / "hls"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+
+        downloader = HLSDownloader(
+            output_dir=str(cache_dir),
+            days_before=30,
+            min_days_before=7,
+        )
+
+        try:
+            successes, failures = downloader.download_for_events([event])
+            if event.event_id in successes:
+                composites = downloader.get_available_composites()
+                if event.event_id in composites:
+                    image_path = composites[event.event_id]
+                    click.echo(f"  ✓ Downloaded HLS imagery to: {image_path}")
+                else:
+                    click.echo("  ✗ No HLS imagery available for this location/date")
+                    return
+            else:
+                click.echo("  ✗ HLS download failed")
+                return
+        except Exception as e:
+            click.echo(f"  ✗ Error downloading HLS imagery: {e}")
+            return
+    else:
+        image_path = Path(image)
+
     try:
         from pyrosense.vlm import EarthDialAssistant
     except ImportError:
@@ -547,8 +603,7 @@ def analyze(image: str, lat: float, lon: float, model_path: str, question: str, 
         click.echo("Install with: pip install pyrosense[earthdial]")
         return
 
-    image_path = Path(image)
-    click.echo(f"Analyzing: {image_path.name}")
+    click.echo(f"\nAnalyzing: {image_path.name}")
 
     # Initialize EarthDial (suppress warnings)
     click.echo("Loading EarthDial model...")
@@ -593,7 +648,6 @@ def analyze(image: str, lat: float, lon: float, model_path: str, question: str, 
                 try:
                     from pyrosense.data import FireEvent
                     from pyrosense.features.weather import DailyWeatherExtractor
-                    import pandas as pd
 
                     # Load model
                     loaded = joblib.load(model_path)
@@ -603,11 +657,12 @@ def analyze(image: str, lat: float, lon: float, model_path: str, question: str, 
                         ensemble = loaded
 
                     # Create event and extract features
+                    event_date = pd.Timestamp(date) if date else pd.Timestamp.now()
                     event = FireEvent(
                         event_id="query",
                         latitude=lat if lat else 0.0,
                         longitude=lon if lon else 0.0,
-                        date=pd.Timestamp.now(),
+                        date=event_date,
                         burned_area=0.0,
                     )
 
