@@ -229,11 +229,22 @@ def train(config: str, output: str, skip_download: bool, skip_extraction: bool):
 )
 def predict(model: str, lat: float, lon: float, date: str):
     """Make a prediction for a single location."""
-    from pyrosense.data import FireEvent
-    from pyrosense.features import PrithviExtractor, WeatherExtractor
+    from pyrosense.data import FireEvent, HLSDownloader
+    from pyrosense.features import PrithviExtractor
+    from pyrosense.features.weather import DailyWeatherExtractor
 
-    # Load model
-    ensemble = joblib.load(model)
+    import tempfile
+
+    # Load model (handle both dict package and direct model)
+    loaded = joblib.load(model)
+    if isinstance(loaded, dict) and "model" in loaded:
+        # Model saved as package with metadata
+        ensemble = loaded["model"]
+        feature_sources = loaded.get("feature_sources", ["prithvi", "weather"])
+    else:
+        # Model saved directly
+        ensemble = loaded
+        feature_sources = ["prithvi", "weather"]
 
     # Create event
     event = FireEvent(
@@ -244,33 +255,122 @@ def predict(model: str, lat: float, lon: float, date: str):
         burned_area=0.0,
     )
 
-    # Extract features
-    logger.info(f"Extracting features for ({lat}, {lon}) on {date}")
+    click.echo(f"Making prediction for ({lat}, {lon}) on {date}...")
+    click.echo(f"Feature sources: {', '.join(feature_sources)}")
+    click.echo("")
 
     features = {}
 
-    # Prithvi features
-    prithvi = PrithviExtractor()
-    prithvi_result = prithvi.extract(event)
-    for name, val in zip(prithvi_result.feature_names, prithvi_result.features):
-        features[f"prithvi_{name}"] = val
+    # Step 1: Download HLS imagery if Prithvi features are needed
+    if "prithvi" in feature_sources:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            click.echo("Step 1/3: Downloading HLS satellite imagery...")
+            downloader = HLSDownloader(
+                output_dir=temp_dir,
+                days_before=30,
+                min_days_before=7,
+            )
 
-    # Weather features
-    weather = WeatherExtractor()
-    weather_result = weather.extract(event)
-    for name, val in zip(weather_result.feature_names, weather_result.features):
-        features[f"weather_{name}"] = val
+            try:
+                successes, failures = downloader.download_for_events([event])
+                if event.event_id in successes:
+                    composites = downloader.get_available_composites()
+                    if event.event_id in composites:
+                        image_path = composites[event.event_id]
+                        click.echo(f"  ✓ Downloaded HLS imagery: {image_path.name}")
+
+                        # Extract Prithvi features
+                        click.echo("\nStep 2/3: Extracting Prithvi features (satellite imagery)...")
+                        prithvi = PrithviExtractor(device="auto")
+                        prithvi_result = prithvi.extract(event, image_path=image_path)
+                        for name, val in zip(prithvi_result.feature_names, prithvi_result.features):
+                            features[f"prithvi_{name}"] = val
+                        click.echo(f"  ✓ Extracted {len(prithvi_result.features)} Prithvi features")
+                    else:
+                        click.echo("  ✗ No HLS imagery available for this location/date")
+                        click.echo("    Continuing with weather features only...")
+                else:
+                    click.echo("  ✗ HLS download failed")
+                    click.echo("    Continuing with weather features only...")
+            except Exception as e:
+                click.echo(f"  ✗ Error downloading HLS imagery: {e}")
+                click.echo("    Continuing with weather features only...")
+    else:
+        click.echo("Step 1/3: Skipping satellite imagery (not used by model)")
+        click.echo("Step 2/3: Skipping Prithvi features (not used by model)")
+
+    # Step 2: Extract weather features
+    step_num = 3 if "prithvi" in feature_sources else 1
+    click.echo(f"\nStep {step_num}/3: Extracting weather features (7-day history)...")
+    try:
+        weather = DailyWeatherExtractor(days_before=7)
+        weather_result = weather.extract(event)
+        for name, val in zip(weather_result.feature_names, weather_result.features):
+            features[f"weather_{name}"] = val
+        click.echo(f"  ✓ Extracted {len(weather_result.features)} weather features")
+    except Exception as e:
+        click.echo(f"  ✗ Error extracting weather features: {e}")
+        return
+
+    # Step 3: Extract AlphaEarth features if needed
+    if "alphaearth" in feature_sources:
+        click.echo("\nStep 3/3: Extracting AlphaEarth features...")
+        try:
+            from pyrosense.features.alphaearth import AlphaEarthExtractor
+            import os
+            gcp_project = os.environ.get("GOOGLE_CLOUD_PROJECT", "pyrosense")
+            alphaearth = AlphaEarthExtractor(project=gcp_project)
+            alphaearth_result = alphaearth.extract(event)
+            for name, val in zip(alphaearth_result.feature_names, alphaearth_result.features):
+                features[f"alphaearth_{name}"] = val
+            click.echo(f"  ✓ Extracted {len(alphaearth_result.features)} AlphaEarth features")
+        except ImportError:
+            click.echo("  ✗ AlphaEarth not available (requires earthengine-api)")
+        except Exception as e:
+            click.echo(f"  ✗ Error extracting AlphaEarth features: {e}")
 
     # Create DataFrame
     X = pd.DataFrame([features])
 
-    # Predict
-    probas = ensemble.predict_proba(X)
-    fire_prob = probas[0, 1]
+    # Fill missing features with zeros if needed
+    try:
+        if hasattr(ensemble, 'feature_names_in_'):
+            expected_features = ensemble.feature_names_in_
+            missing = set(expected_features) - set(X.columns)
+            if missing:
+                click.echo(f"\n  Note: Filling {len(missing)} missing features with zeros")
+                for feat in missing:
+                    X[feat] = 0.0
+            X = X[list(expected_features)]  # Reorder to match training
+    except Exception as e:
+        click.echo(f"  Warning: Could not align features: {e}")
 
-    click.echo(f"\nPrediction for ({lat}, {lon}) on {date}:")
-    click.echo(f"  Fire probability: {fire_prob:.2%}")
-    click.echo(f"  Risk level: {'HIGH' if fire_prob > 0.7 else 'MEDIUM' if fire_prob > 0.3 else 'LOW'}")
+    # Make prediction
+    click.echo("\n" + "="*60)
+    click.echo("FIRE RISK PREDICTION")
+    click.echo("="*60)
+
+    try:
+        probas = ensemble.predict_proba(X)
+        fire_prob = probas[0, 1]
+
+        click.echo(f"Location:  ({lat}, {lon})")
+        click.echo(f"Date:      {date}")
+        click.echo(f"")
+        click.echo(f"Fire Probability:  {fire_prob:.1%}")
+
+        if fire_prob > 0.7:
+            risk_level = "🔴 HIGH"
+        elif fire_prob > 0.4:
+            risk_level = "🟡 MEDIUM"
+        else:
+            risk_level = "🟢 LOW"
+
+        click.echo(f"Risk Level:        {risk_level}")
+        click.echo("="*60)
+    except Exception as e:
+        click.echo(f"Prediction failed: {e}")
+        raise
 
 
 @cli.command()
@@ -412,10 +512,33 @@ def analyze(image: str, lat: float, lon: float, model_path: str, question: str, 
     import warnings
     import logging
     import os
+    import sys
+    from io import StringIO
+    from contextlib import contextmanager
+
     warnings.filterwarnings("ignore")
-    logging.getLogger("transformers").setLevel(logging.ERROR)
-    logging.getLogger("transformers.tokenization_utils_base").setLevel(logging.ERROR)
+    os.environ['TRANSFORMERS_VERBOSITY'] = 'error'
     os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+    # Suppress all transformers logging
+    logging.getLogger("transformers").setLevel(logging.CRITICAL)
+    logging.getLogger("transformers.modeling_utils").setLevel(logging.CRITICAL)
+    logging.getLogger("transformers.configuration_utils").setLevel(logging.CRITICAL)
+    logging.getLogger("transformers.modeling_attn_mask_utils").setLevel(logging.CRITICAL)
+    logging.getLogger("transformers.tokenization_utils_base").setLevel(logging.CRITICAL)
+
+    @contextmanager
+    def suppress_output():
+        """Context manager to suppress stdout/stderr."""
+        old_stdout = sys.stdout
+        old_stderr = sys.stderr
+        try:
+            sys.stdout = StringIO()
+            sys.stderr = StringIO()
+            yield
+        finally:
+            sys.stdout = old_stdout
+            sys.stderr = old_stderr
 
     try:
         from pyrosense.vlm import EarthDialAssistant
@@ -427,37 +550,107 @@ def analyze(image: str, lat: float, lon: float, model_path: str, question: str, 
     image_path = Path(image)
     click.echo(f"Analyzing: {image_path.name}")
 
-    # Initialize EarthDial
-    assistant = EarthDialAssistant(
-        device=device,
-        load_in_8bit=load_8bit,
-    )
+    # Initialize EarthDial (suppress warnings)
+    click.echo("Loading EarthDial model...")
+    with suppress_output():
+        assistant = EarthDialAssistant(
+            device=device,
+            load_in_8bit=load_8bit,
+        )
 
     # Show device info
     info = assistant.device_info
     click.echo(f"Device: {info['device']}")
 
-    # Default question
-    if question is None:
-        question = "Analyze this satellite image and assess fire risk factors. Describe the vegetation, terrain, and any features relevant to fire behavior."
-
-    # Add context if lat/lon provided
-    if lat is not None and lon is not None:
-        question = f"Location: {lat:.4f}, {lon:.4f}\n\n{question}"
-
-    click.echo("\nLoading EarthDial model...")
-
     try:
-        # Pass lat/lon for proper cropping (crops to 6.7 km x 6.7 km area)
-        response = assistant.analyze_image(
-            image_path, question,
-            center_lat=lat, center_lon=lon
-        )
-        click.echo("\n" + "=" * 60)
-        click.echo("EarthDial Analysis:")
-        click.echo("=" * 60)
-        click.echo(response)
-        click.echo("=" * 60)
+        # If custom question provided, use analyze_image
+        if question is not None:
+            # Add context if lat/lon provided
+            if lat is not None and lon is not None:
+                question = f"Location: {lat:.4f}, {lon:.4f}\n\n{question}"
+
+            click.echo("Generating analysis...\n")
+
+            with suppress_output():
+                response = assistant.analyze_image(
+                    image_path, question,
+                    center_lat=lat, center_lon=lon
+                )
+
+            click.echo("=" * 60)
+            click.echo("EarthDial Analysis:")
+            click.echo("=" * 60)
+            click.echo(response)
+            click.echo("=" * 60)
+
+        else:
+            # Default: Use structured report (same as notebook)
+            click.echo("Generating structured fire risk report...\n")
+
+            # Get fire probability if model provided
+            fire_probability = None
+            if model_path is not None:
+                try:
+                    from pyrosense.data import FireEvent
+                    from pyrosense.features.weather import DailyWeatherExtractor
+                    import pandas as pd
+
+                    # Load model
+                    loaded = joblib.load(model_path)
+                    if isinstance(loaded, dict) and "model" in loaded:
+                        ensemble = loaded["model"]
+                    else:
+                        ensemble = loaded
+
+                    # Create event and extract features
+                    event = FireEvent(
+                        event_id="query",
+                        latitude=lat if lat else 0.0,
+                        longitude=lon if lon else 0.0,
+                        date=pd.Timestamp.now(),
+                        burned_area=0.0,
+                    )
+
+                    weather = DailyWeatherExtractor(days_before=7)
+                    weather_result = weather.extract(event)
+                    features = {f"weather_{name}": val
+                               for name, val in zip(weather_result.feature_names, weather_result.features)}
+                    X = pd.DataFrame([features])
+
+                    # Fill missing features with zeros
+                    if hasattr(ensemble, 'feature_names_in_'):
+                        for feat in ensemble.feature_names_in_:
+                            if feat not in X.columns:
+                                X[feat] = 0.0
+                        X = X[list(ensemble.feature_names_in_)]
+
+                    fire_probability = ensemble.predict_proba(X)[0, 1]
+                except Exception:
+                    pass  # Ignore errors, just won't have probability
+
+            # Generate structured report
+            with suppress_output():
+                report = assistant.generate_report(
+                    image_path,
+                    fire_probability=fire_probability,
+                    center_lat=lat,
+                    center_lon=lon,
+                )
+
+            click.echo("=" * 60)
+            click.echo("EARTHDIAL FIRE RISK REPORT")
+            click.echo("=" * 60)
+            if fire_probability is not None:
+                click.echo(f"\nFire Probability: {fire_probability:.1%}")
+            if lat is not None and lon is not None:
+                click.echo(f"Location: {lat:.4f}, {lon:.4f}")
+            click.echo(f"\nSUMMARY:\n{report['summary']}")
+            click.echo(f"\nVEGETATION:\n{report['vegetation_analysis']}")
+            click.echo(f"\nTERRAIN:\n{report['terrain_factors']}")
+            click.echo(f"\nSTRATEGIES:\n{report['recommended_strategies']}")
+            click.echo(f"\nRISK ASSESSMENT:\n{report['risk_assessment']}")
+            click.echo("=" * 60)
+
     except Exception as e:
         click.echo(f"Analysis failed: {e}")
         raise
@@ -489,10 +682,33 @@ def chat(image: str, lat: float, lon: float, device: str, load_8bit: bool):
     import warnings
     import logging
     import os
+    import sys
+    from io import StringIO
+    from contextlib import contextmanager
+
     warnings.filterwarnings("ignore")
-    logging.getLogger("transformers").setLevel(logging.ERROR)
-    logging.getLogger("transformers.tokenization_utils_base").setLevel(logging.ERROR)
+    os.environ['TRANSFORMERS_VERBOSITY'] = 'error'
     os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+    # Suppress all transformers logging
+    logging.getLogger("transformers").setLevel(logging.CRITICAL)
+    logging.getLogger("transformers.modeling_utils").setLevel(logging.CRITICAL)
+    logging.getLogger("transformers.configuration_utils").setLevel(logging.CRITICAL)
+    logging.getLogger("transformers.modeling_attn_mask_utils").setLevel(logging.CRITICAL)
+    logging.getLogger("transformers.tokenization_utils_base").setLevel(logging.CRITICAL)
+
+    @contextmanager
+    def suppress_output():
+        """Context manager to suppress stdout/stderr."""
+        old_stdout = sys.stdout
+        old_stderr = sys.stderr
+        try:
+            sys.stdout = StringIO()
+            sys.stderr = StringIO()
+            yield
+        finally:
+            sys.stdout = old_stdout
+            sys.stderr = old_stderr
 
     try:
         from pyrosense.vlm import EarthDialAssistant
@@ -505,11 +721,12 @@ def chat(image: str, lat: float, lon: float, device: str, load_8bit: bool):
     click.echo(f"Image: {image_path.name}")
     click.echo("Loading EarthDial model...")
 
-    # Initialize EarthDial
-    assistant = EarthDialAssistant(
-        device=device,
-        load_in_8bit=load_8bit,
-    )
+    # Initialize EarthDial (suppress warnings)
+    with suppress_output():
+        assistant = EarthDialAssistant(
+            device=device,
+            load_in_8bit=load_8bit,
+        )
 
     # Show device info
     info = assistant.device_info
@@ -533,10 +750,11 @@ def chat(image: str, lat: float, lon: float, device: str, load_8bit: bool):
             continue
 
         try:
-            response, history = assistant.chat(
-                image_path, question, history,
-                center_lat=lat, center_lon=lon
-            )
+            with suppress_output():
+                response, history = assistant.chat(
+                    image_path, question, history,
+                    center_lat=lat, center_lon=lon
+                )
             click.echo(f"\nEarthDial: {response}\n")
         except Exception as e:
             click.echo(f"Error: {e}")

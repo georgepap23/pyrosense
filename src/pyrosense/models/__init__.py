@@ -25,6 +25,9 @@ from pyrosense.models.classifiers import (
     create_classifier,
     get_default_classifier,
 )
+from pyrosense.models.optimization import (
+    optimize_base_models,
+)
 
 __all__ = [
     "StackingEnsemble",
@@ -33,4 +36,5 @@ __all__ = [
     "ClassifierConfig",
     "create_classifier",
     "get_default_classifier",
+    "optimize_base_models",
 ]

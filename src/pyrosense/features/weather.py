@@ -298,3 +298,210 @@ class WeatherExtractor(BaseFeatureExtractor):
             f"{len(df.columns)} features"
         )
         return df
+
+
+@register_extractor("weather_daily")
+class DailyWeatherExtractor(BaseFeatureExtractor):
+    """
+    Extracts daily (non-aggregated) weather features from Open-Meteo Archive API.
+
+    Returns all 9 weather variables for each day in the lookback window,
+    allowing the model to learn temporal patterns.
+
+    Usage:
+        extractor = DailyWeatherExtractor(days_before=7)
+        features = extractor.extract(event)  # Returns 63 features (7 days × 9 vars)
+    """
+
+    BASE_URL = "https://archive-api.open-meteo.com/v1/archive"
+
+    DAILY_VARS: list[str] = [
+        "temperature_2m_max",
+        "temperature_2m_min",
+        "temperature_2m_mean",
+        "relative_humidity_2m_max",
+        "relative_humidity_2m_min",
+        "relative_humidity_2m_mean",
+        "wind_speed_10m_max",
+        "wind_speed_10m_mean",
+        "precipitation_sum",
+    ]
+
+    def __init__(
+        self,
+        days_before: int = 7,
+        cache_dir: str | Path | None = None,
+    ) -> None:
+        """
+        Args:
+            days_before: Number of days before event to fetch weather for
+            cache_dir: Optional directory to cache weather responses
+        """
+        self.days_before = days_before
+        self.cache_dir = Path(cache_dir) if cache_dir else None
+        if self.cache_dir:
+            self.cache_dir.mkdir(parents=True, exist_ok=True)
+
+    @property
+    def feature_dim(self) -> int:
+        """Daily weather extractor produces days_before × 9 features."""
+        return self.days_before * len(self.DAILY_VARS)
+
+    @property
+    def feature_names(self) -> list[str]:
+        """Feature names without source prefix."""
+        names = []
+        for day_idx in range(self.days_before):
+            for var_name in self.DAILY_VARS:
+                var_short = var_name.replace("_2m", "").replace("_10m", "")
+                names.append(f"d{day_idx+1}_{var_short}")
+        return names
+
+    @property
+    def source_name(self) -> str:
+        """Source identifier for weather features."""
+        return "weather"
+
+    def extract(
+        self,
+        event: FireEvent,
+        **kwargs,
+    ) -> FeatureResult:
+        """
+        Fetch daily weather features for a single event.
+
+        Args:
+            event: FireEvent with lat, lon, date
+            **kwargs: Additional arguments (unused)
+
+        Returns:
+            FeatureResult with daily weather values (no aggregation)
+        """
+        if not REQUESTS_AVAILABLE:
+            logger.error("requests library not available")
+            return self._empty_result(event.event_id)
+
+        # Calculate date range
+        end_date = event.date - timedelta(days=1)  # Day before event
+        start_date = end_date - timedelta(days=self.days_before - 1)
+
+        params = {
+            "latitude": event.latitude,
+            "longitude": event.longitude,
+            "start_date": start_date.strftime("%Y-%m-%d"),
+            "end_date": end_date.strftime("%Y-%m-%d"),
+            "daily": ",".join(self.DAILY_VARS),
+            "timezone": "UTC",
+        }
+
+        try:
+            response = requests.get(self.BASE_URL, params=params, timeout=30)
+            response.raise_for_status()
+            data = response.json()
+        except Exception as e:
+            logger.warning(f"Weather fetch failed for {event.event_id}: {e}")
+            return self._empty_result(event.event_id)
+
+        if "daily" not in data:
+            logger.warning(f"No daily data in response for {event.event_id}")
+            return self._empty_result(event.event_id)
+
+        # Flatten daily values into feature array
+        features = self._flatten_daily_weather(data["daily"])
+
+        return FeatureResult(
+            event_id=event.event_id,
+            features=features,
+            feature_names=self.feature_names,
+            source=self.source_name,
+            metadata={
+                "days_before": self.days_before,
+                "latitude": event.latitude,
+                "longitude": event.longitude,
+            },
+        )
+
+    def _flatten_daily_weather(self, daily_data: dict) -> np.ndarray:
+        """
+        Flatten daily weather values into a 1D feature array.
+
+        Returns array in format: [day1_var1, day1_var2, ..., dayN_var9]
+        """
+        features = []
+
+        for day_idx in range(self.days_before):
+            for var_name in self.DAILY_VARS:
+                try:
+                    value = daily_data[var_name][day_idx]
+                    features.append(float(value) if value is not None else np.nan)
+                except (KeyError, IndexError, TypeError):
+                    features.append(np.nan)
+
+        return np.array(features)
+
+    def _empty_result(self, event_id: str) -> FeatureResult:
+        """Create an empty result with NaN values for failed fetches."""
+        return FeatureResult(
+            event_id=event_id,
+            features=np.full(self.feature_dim, np.nan),
+            feature_names=self.feature_names,
+            source=self.source_name,
+            metadata={"error": "fetch_failed"},
+        )
+
+    def extract_batch(
+        self,
+        events: list[FireEvent],
+        progress: bool = True,
+        **kwargs,
+    ) -> pd.DataFrame:
+        """
+        Extract daily weather features for multiple events.
+
+        Args:
+            events: List of FireEvent objects
+            progress: Whether to log progress
+            **kwargs: Additional arguments
+
+        Returns:
+            DataFrame with event_id as index and daily weather features as columns
+        """
+        results: list[FeatureResult] = []
+        n_events = len(events)
+
+        for i, event in enumerate(events):
+            if progress and (i + 1) % 10 == 0:
+                logger.info(f"[{self.source_name}] Fetching: {i + 1}/{n_events}")
+
+            try:
+                result = self.extract(event, **kwargs)
+                results.append(result)
+            except Exception as e:
+                logger.warning(f"[{self.source_name}] Failed for {event.event_id}: {e}")
+                results.append(self._empty_result(event.event_id))
+
+        if not results:
+            return pd.DataFrame()
+
+        # Build DataFrame from results
+        rows = []
+        for result in results:
+            row = {"event_id": result.event_id}
+            row.update(result.to_dict())
+            rows.append(row)
+
+        df = pd.DataFrame(rows)
+        df.set_index("event_id", inplace=True)
+
+        # Fill missing values with column medians
+        for col in df.columns:
+            if df[col].isna().any():
+                median_val = df[col].median()
+                if pd.notna(median_val):
+                    df[col] = df[col].fillna(median_val)
+
+        logger.info(
+            f"[{self.source_name}] Extracted {len(df)} events, "
+            f"{len(df.columns)} features"
+        )
+        return df

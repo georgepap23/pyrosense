@@ -48,6 +48,7 @@ from sklearn.base import BaseEstimator, ClassifierMixin, clone
 from sklearn.model_selection import StratifiedKFold, cross_val_predict
 from sklearn.preprocessing import StandardScaler
 from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import RandomForestClassifier
 
 from pyrosense.models.classifiers import (
     ClassifierConfig,
@@ -137,14 +138,58 @@ class StackingConfig:
 
     @classmethod
     def simple(cls, sources: list[str] | None = None) -> StackingConfig:
-        """Create a simple configuration with default models."""
+        """
+        Create configuration with best hyperparameters from grid search.
+
+        Uses optimized settings based on 5-fold CV on PyroSense dataset:
+        - Prithvi: RF (AUC=0.9111, max_depth=10, max_features=0.1)
+        - Weather: GB (AUC=0.9810, max_depth=3, learning_rate=0.1)
+        - AlphaEarth: RF (AUC=0.7760, max_depth=10, max_features=0.3)
+        """
+        from sklearn.ensemble import GradientBoostingClassifier
+
         if sources is None:
             sources = ["prithvi", "weather"]
 
-        feature_groups = [
-            FeatureGroup(name=source, column_prefix=f"{source}_")
-            for source in sources
-        ]
+        feature_groups = []
+
+        for source in sources:
+            if source == "prithvi":
+                # Best: RF with max_depth=10, max_features=0.1, n_estimators=100
+                base_model = RandomForestClassifier(
+                    n_estimators=100,
+                    max_depth=10,
+                    max_features=0.1,
+                    min_samples_leaf=1,
+                    random_state=42,
+                    n_jobs=-1
+                )
+            elif source == "weather":
+                # Best: GB with learning_rate=0.1, max_depth=3, n_estimators=200
+                base_model = GradientBoostingClassifier(
+                    n_estimators=200,
+                    max_depth=3,
+                    learning_rate=0.1,
+                    subsample=0.8,
+                    random_state=42
+                )
+            elif source == "alphaearth":
+                # Best: RF with max_depth=10, max_features=0.3, n_estimators=200
+                base_model = RandomForestClassifier(
+                    n_estimators=200,
+                    max_depth=10,
+                    max_features=0.3,
+                    min_samples_leaf=2,
+                    random_state=42,
+                    n_jobs=-1
+                )
+            else:
+                # Fallback: default RF for unknown sources
+                base_model = None
+
+            feature_groups.append(
+                FeatureGroup(name=source, column_prefix=f"{source}_", base_model=base_model)
+            )
 
         return cls(
             feature_groups=feature_groups,
