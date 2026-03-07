@@ -91,3 +91,6 @@ rgb_preview.png
 
 # Experiment outputs
 experiment_results.json
+
+# Claude Code worktrees
+.claude/worktrees/
